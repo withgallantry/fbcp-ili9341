@@ -115,7 +115,7 @@
 #define SAVE_BATTERY_BY_PREDICTING_FRAME_ARRIVAL_TIMES
 
 // If defined, rotates the display 180 degrees
-// #define DISPLAY_ROTATE_180_DEGREES
+#define DISPLAY_ROTATE_180_DEGREES
 
 // If defined, displays in landscape. Undefine to display in portrait. When changing this, swap
 // values of DISPLAY_WIDTH and DISPLAY_HEIGHT accordingly
