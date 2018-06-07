@@ -74,7 +74,7 @@ void InitILI9341()
 #if defined(DISPLAY_OUTPUT_LANDSCAPE) && !defined(DISPLAY_FLIP_OUTPUT_XY_IN_SOFTWARE)
     madctl |= MADCTL_ROW_COLUMN_EXCHANGE;
 #endif
-    SPI_TRANSFER(0x36/*MADCTL: Memory Access Control*/, madctl);
+    SPI_TRANSFER(0x36/*MADCTL: Memory Access Control*/, 0xC0);
 
     SPI_TRANSFER(0x3A/*COLMOD: Pixel Format Set*/, 0x55/*DPI=16bits/pixel,DBI=16bits/pixel*/);
     SPI_TRANSFER(0xB1/*Frame Rate Control (In Normal Mode/Full Colors)*/, 0x00/*DIVA=fosc*/, ILI9341_UPDATE_FRAMERATE/*RTNA(Frame Rate)*/);
