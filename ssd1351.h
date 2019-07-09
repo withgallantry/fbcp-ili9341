@@ -2,10 +2,6 @@
 
 #ifdef SSD1351
 
-#ifndef SPI_BUS_CLOCK_DIVISOR
-#error Please define -DSPI_BUS_CLOCK_DIVISOR=<some even number> on the CMake command line! (see file ssd1351.h for details). This parameter along with core_freq=xxx in /boot/config.txt defines the SPI display speed.
-#endif
-
 // On Adafruit's Adafruit 1.27" and 1.5" Color OLED Breakout Board 128x96 SSD1351 display, the following speed configurations have been tested (on a Pi 3B):
 
 // core_freq=360: CDIV=20, results in 18.00MHz, works
@@ -17,13 +13,12 @@
 // , so the above obtained best refresh rate allows driving the screen at 60fps.
 
 // Data specific to the SSD1351 controller
-#define DISPLAY_BYTESPERPIXEL 2
 #define DISPLAY_SET_CURSOR_X 0x15
 #define DISPLAY_SET_CURSOR_Y 0x75
 #define DISPLAY_WRITE_PIXELS 0x5C
 
-#define DISPLAY_WIDTH 128
-#define DISPLAY_HEIGHT 96
+#define DISPLAY_NATIVE_WIDTH 128
+#define DISPLAY_NATIVE_HEIGHT 96
 
 #define MUST_SEND_FULL_CURSOR_WINDOW
 
@@ -31,11 +26,10 @@
 // other displays, where issuing a DISPLAY_WRITE_PIXELS command resets the x&y cursor coordinates.
 #define DISPLAY_WRITE_PIXELS_CMD_DOES_NOT_RESET_WRITE_CURSOR
 
-#define InitSPIDisplay InitSSD1351
+// This is defined for displays that have the set cursor command 8 bits wide (0-255) instead of 16 bits (0-65535)
+#define DISPLAY_SET_CURSOR_IS_8_BIT
 
-#if !defined(GPIO_TFT_DATA_CONTROL)
-#error Please reconfigure CMake with -DGPIO_TFT_DATA_CONTROL=<int> specifying which pin your display is using for the Data/Control line!
-#endif
+#define InitSPIDisplay InitSSD1351
 
 void InitSSD1351(void);
 

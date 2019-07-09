@@ -7,24 +7,6 @@
 #include <memory.h>
 #include <stdio.h>
 
-static void SSD1351ClearScreen()
-{
-  // Since we are doing delta updates to only changed pixels, clear display initially to black for known starting state
-  for(int y = 0; y < DISPLAY_HEIGHT; ++y)
-  {
-    SPI_TRANSFER(DISPLAY_SET_CURSOR_X, 0, DISPLAY_WIDTH-1);
-    SPI_TRANSFER(DISPLAY_SET_CURSOR_Y, (uint8_t)y, DISPLAY_HEIGHT-1);
-    SPITask *clearLine = AllocTask(DISPLAY_WIDTH*2);
-    clearLine->cmd = DISPLAY_WRITE_PIXELS;
-    memset(clearLine->data, 0, clearLine->size);
-    CommitTask(clearLine);
-    RunSPITask(clearLine);
-    DoneTask(clearLine);
-  }
-  SPI_TRANSFER(DISPLAY_SET_CURSOR_X, 0, DISPLAY_WIDTH-1);
-  SPI_TRANSFER(DISPLAY_SET_CURSOR_Y, 0, DISPLAY_HEIGHT-1);
-}
-
 void InitSSD1351()
 {
   // If a Reset pin is defined, toggle it briefly high->low->high to enable the device. Some devices do not have a reset pin, in which case compile with GPIO_TFT_RESET_PIN left undefined.
@@ -67,13 +49,14 @@ void InitSSD1351()
 
     SPI_TRANSFER(0xA6/*Set Display Normal*/);
     SPI_TRANSFER(0xAF/*Sleep Mode OFF/Display ON*/);
-    SSD1351ClearScreen();
+    ClearScreen();
   }
 #ifndef USE_DMA_TRANSFERS // For DMA transfers, keep SPI CS & TA active.
   END_SPI_COMMUNICATION();
 #endif
 
   // And speed up to the desired operation speed finally after init is done.
+  usleep(10 * 1000); // Delay a bit before restoring CLK, or otherwise this has been observed to cause the display not init if done back to back after the clear operation above.
   spi->clk = SPI_BUS_CLOCK_DIVISOR;
 }
 
@@ -107,7 +90,7 @@ void TurnDisplayOn()
 
 void DeinitSPIDisplay()
 {
-
+  ClearScreen();
 }
 
 #endif

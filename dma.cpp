@@ -1,20 +1,16 @@
 #ifndef KERNEL_MODULE
-#include <stdio.h>
-#include <stdlib.h>
-#include <memory.h>
-#include <inttypes.h>
-#include <syslog.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <fcntl.h>
-#include <bcm_host.h>
+#include <stdio.h> // fprintf, stderr
+#include <stdlib.h> // exit
+#include <memory.h> // memset, memcpy
+#include <inttypes.h> // uint32_t
+#include <syslog.h> // syslog
+#include <sys/mman.h> // mmap, munmap, PROT_READ, PROT_WRITE
 #endif
 
 #include "config.h"
 #include "dma.h"
 #include "spi.h"
+#include "gpu.h"
 #include "util.h"
 #include "mailbox.h"
 
@@ -43,7 +39,7 @@ struct GpuMemory
 };
 
 #define NUM_DMA_CBS 1024
-GpuMemory dmaCb, dmaSourceBuffer;
+GpuMemory dmaCb, dmaSourceBuffer, dmaConstantData;
 
 volatile DMAControlBlock *dmaSendTail = 0;
 volatile DMAControlBlock *dmaRecvTail = 0;
@@ -130,27 +126,30 @@ void FreeDMAChannel(int channel)
 
 #define VIRT_TO_BUS(block, x) ((uintptr_t)(x) - (uintptr_t)((block).virtualAddr) + (block).busAddress)
 
+uint64_t totalGpuMemoryUsed = 0;
+
 // Allocates the given number of bytes in GPU side memory, and returns the virtual address and physical bus address of the allocated memory block.
 // The virtual address holds an uncached view to the allocated memory, so writes and reads to that memory address bypass the L1 and L2 caches. Use
 // this kind of memory to pass data blocks over to the DMA controller to process.
-GpuMemory AllocateUncachedGpuMemory(uint32_t numBytes)
+GpuMemory AllocateUncachedGpuMemory(uint32_t numBytes, const char *reason)
 {
   GpuMemory mem;
   mem.sizeBytes = ALIGN_UP(numBytes, PAGE_SIZE);
-#ifdef PI_ZERO
   uint32_t allocationFlags = MEM_ALLOC_FLAG_DIRECT | MEM_ALLOC_FLAG_COHERENT;
-#else
-  uint32_t allocationFlags = MEM_ALLOC_FLAG_DIRECT;
-#endif
   mem.allocationHandle = Mailbox(MEM_ALLOC_MESSAGE, /*size=*/mem.sizeBytes, /*alignment=*/PAGE_SIZE, /*flags=*/allocationFlags);
+  if (!mem.allocationHandle) FATAL_ERROR("Failed to allocate GPU memory! Try increasing gpu_mem allocation in /boot/config.txt. See https://www.raspberrypi.org/documentation/configuration/config-txt/memory.md");
   mem.busAddress = Mailbox(MEM_LOCK_MESSAGE, mem.allocationHandle);
+  if (!mem.busAddress) FATAL_ERROR("Failed to lock GPU memory!");
   mem.virtualAddr = mmap(0, mem.sizeBytes, PROT_READ | PROT_WRITE, MAP_SHARED, mem_fd, BUS_TO_PHYS(mem.busAddress));
   if (mem.virtualAddr == MAP_FAILED) FATAL_ERROR("Failed to mmap GPU memory!");
+  totalGpuMemoryUsed += mem.sizeBytes;
+//  printf("Allocated %u bytes of GPU memory for %s (bus address=%p). Total GPU memory used: %llu bytes\n", mem.sizeBytes, reason, (void*)mem.busAddress, totalGpuMemoryUsed);
   return mem;
 }
 
 void FreeUncachedGpuMemory(GpuMemory mem)
 {
+  totalGpuMemoryUsed -= mem.sizeBytes;
   munmap(mem.virtualAddr, mem.sizeBytes);
   Mailbox(MEM_UNLOCK_MESSAGE, mem.allocationHandle);
   Mailbox(MEM_FREE_MESSAGE, mem.allocationHandle);
@@ -235,11 +234,17 @@ int InitDMA()
 #endif
 
 #if !defined(KERNEL_MODULE)
-  dmaCb = AllocateUncachedGpuMemory(sizeof(DMAControlBlock) * NUM_DMA_CBS);
+  dmaCb = AllocateUncachedGpuMemory(sizeof(DMAControlBlock) * NUM_DMA_CBS, "DMA control blocks");
   memset(dmaCb.virtualAddr, 0, dmaCb.sizeBytes); // Some fields of the CBs (debug, reserved) are initialized to zero and assumed to stay so throughout app lifetime.
-  dmaSourceBuffer = AllocateUncachedGpuMemory(SHARED_MEMORY_SIZE*2);
-  dmaSourceEnd = (volatile uint8_t *)dmaSourceBuffer.virtualAddr;
   firstFreeCB = (volatile DMAControlBlock *)dmaCb.virtualAddr;
+
+  dmaSourceBuffer = AllocateUncachedGpuMemory(SHARED_MEMORY_SIZE*2, "DMA source data");
+  dmaSourceEnd = (volatile uint8_t *)dmaSourceBuffer.virtualAddr;
+
+  dmaConstantData = AllocateUncachedGpuMemory(2*sizeof(uint32_t), "DMA constant data");
+  uint32_t *constantData = (uint32_t *)dmaConstantData.virtualAddr;
+  constantData[0] = BCM2835_SPI0_CS_DMAEN; // constantData[0] is for disableTransferActive task
+  constantData[1] = BCM2835_DMA_CS_ACTIVE | BCM2835_DMA_CS_END; // constantData[1] is for startDMATxChannel task
 #endif
 
   LOG("DMA hardware register file is at ptr: %p, using DMA TX channel: %d and DMA RX channel: %d", dma0, dmaTxChannel, dmaRxChannel);
@@ -267,6 +272,9 @@ int InitDMA()
   }
   if (dmaRx->cbAddr != 0 && (dmaRx->cs & BCM2835_DMA_CS_ACTIVE))
     FATAL_ERROR("DMA RX channel was in use!");
+
+  if ((dmaRx->cb.debug & BCM2835_DMA_DEBUG_LITE) != 0)
+    FATAL_ERROR("DMA RX channel cannot be a lite channel, because to get best performance we want to use BCM2835_DMA_TI_DEST_IGNORE DMA operation mode that lite DMA channels do not have. (Try using DMA RX channel value < 7)");
 
   LOG("Resetting DMA channels for use");
   ResetDMAChannels();
@@ -391,24 +399,113 @@ void WaitForDMAFinished()
 
 #ifdef ALL_TASKS_SHOULD_DMA
 
+// This function does a memcpy from one source buffer to two destination buffers simultaneously.
+// It saves a lot of time on ARMv6 by avoiding to have to do two separate memory copies, because the ARMv6 L1 cache is so tiny (4K) that it cannot fit a whole framebuffer
+// in memory at a time. Streaming through it only once instead of twice helps memory bandwidth immensely, this is profiled to be ~4x faster than a pair of memcpys or a simple CPU loop.
+// In addition, this does a little endian->big endian conversion when copying data out to dstDma.
+static void memcpy_to_dma_and_prev_framebuffer(uint16_t *dstDma, uint16_t **dstPrevFramebuffer, uint16_t **srcFramebuffer, int numBytes, int *taskStartX, int width, int stride)
+{
+  int strideEnd = stride - width*2;
+  int xLeft = width-*taskStartX;
+
+  uint16_t *Src = *srcFramebuffer;
+  uint16_t *Dst1 = *dstPrevFramebuffer;
+
+  // TODO: Do the loops in aligned order with unaligned head and tail separate, and ensure that dstDma, dstPrevFramebuffer and srcFramebuffer are in same alignment phase.
+  asm volatile(
+  "start_%=:\n"
+    "ldrd r0, r1, [%[srcFramebuffer]], #8\n"
+    "pld [%[srcFramebuffer], #248]\n"
+    "strd r0, r1, [%[dstPrevFramebuffer]], #8\n"
+    "rev16 r0, r0\n"
+    "rev16 r1, r1\n"
+    "strd r0, r1, [%[dstDma]], #8\n"
+
+    "ldrd r0, r1, [%[srcFramebuffer]], #8\n"
+    "strd r0, r1, [%[dstPrevFramebuffer]], #8\n"
+    "rev16 r0, r0\n"
+    "rev16 r1, r1\n"
+    "strd r0, r1, [%[dstDma]], #8\n"
+
+    "ldrd r0, r1, [%[srcFramebuffer]], #8\n"
+    "strd r0, r1, [%[dstPrevFramebuffer]], #8\n"
+    "rev16 r0, r0\n"
+    "rev16 r1, r1\n"
+    "strd r0, r1, [%[dstDma]], #8\n"
+
+    "ldrd r0, r1, [%[srcFramebuffer]], #8\n"
+    "strd r0, r1, [%[dstPrevFramebuffer]], #8\n"
+    "rev16 r0, r0\n"
+    "rev16 r1, r1\n"
+    "strd r0, r1, [%[dstDma]], #8\n"
+
+    "subs %[xLeft], %[xLeft], #16\n"
+    "addls %[xLeft], %[xLeft], %[width]\n"
+    "addls %[dstPrevFramebuffer], %[dstPrevFramebuffer], %[strideEnd]\n"
+    "addls %[srcFramebuffer], %[srcFramebuffer], %[strideEnd]\n"
+
+    "subs %[numBytes], %[numBytes], #32\n"
+    "bhi start_%=\n"
+
+    : [dstDma]"+r"(dstDma), [dstPrevFramebuffer]"+r"(Dst1), [srcFramebuffer]"+r"(Src), [xLeft]"+r"(xLeft), [numBytes]"+r"(numBytes)
+    : [strideEnd]"r"(strideEnd), [width]"r"(width)
+    : "r0", "r1", "memory", "cc"
+  );
+  *taskStartX = width - xLeft;
+  *srcFramebuffer = Src;
+  *dstPrevFramebuffer = Dst1;
+}
+
+static void memcpy_to_dma_and_prev_framebuffer_in_c(uint16_t *dstDma, uint16_t **dstPrevFramebuffer, uint16_t **srcFramebuffer, int numBytes, int *taskStartX, int width, int stride)
+{
+  static bool performanceWarningPrinted = false;
+  if (!performanceWarningPrinted)
+  {
+    printf("Performance warning: using slow memcpy_to_dma_and_prev_framebuffer_in_c() function. Check conditions in display.h that enable OFFLOAD_PIXEL_COPY_TO_DMA_CPP and configure to use that instead.\n");
+    performanceWarningPrinted = true;
+  }
+  int numPixels = numBytes>>1;
+  int endStridePixels = (stride>>1) - width;
+  uint16_t *prevData = *dstPrevFramebuffer;
+  uint16_t *data = *srcFramebuffer;
+  for(int i = 0; i < numPixels; ++i)
+  {
+    *prevData++ = *data;
+    dstDma[i] = __builtin_bswap16(*data++);
+    if (++*taskStartX >= width)
+    {
+      *taskStartX = 0;
+      data += endStridePixels;
+      prevData += endStridePixels;
+    }
+  }
+  *srcFramebuffer = data;
+  *dstPrevFramebuffer = prevData;
+}
+
+#if defined(ALL_TASKS_SHOULD_DMA) && defined(SPI_3WIRE_PROTOCOL)
+// Bug: there is something about the chained DMA transfer mechanism that makes write window coordinate set commands not go through properly
+// on 3-wire displays, but do not yet know what. (Remove this #error statement to debug)
+#error ALL_TASKS_SHOULD_DMA and SPI_3WIRE_PROTOCOL are currently not mutually compatible!
+#endif
+
+#if defined(OFFLOAD_PIXEL_COPY_TO_DMA_CPP) && defined(SPI_3WIRE_PROTOCOL)
+// We would have to convert 8-bit tasks to 9-bit tasks immediately after offloaded memcpy has been done below to implement this.
+#error OFFLOAD_PIXEL_COPY_TO_DMA_CPP and SPI_3WIRE_PROTOCOL are not mutually compatible!
+#endif
+
 void SPIDMATransfer(SPITask *task)
 {
 // There is a limit to how many bytes can be sent in one DMA-based SPI task, so if the task
 // is larger than this, we'll split the send into multiple individual DMA SPI transfers
-// and chain them together.
-#define MAX_DMA_SPI_TASK_SIZE 65528
+// and chain them together. This should be a multiple of 32 bytes to keep tasks cache aligned on ARMv6.
+#define MAX_DMA_SPI_TASK_SIZE 65504
 
-  const int numDMASendTasks = (task->size + MAX_DMA_SPI_TASK_SIZE - 1) / MAX_DMA_SPI_TASK_SIZE;
+  const int numDMASendTasks = (task->PayloadSize() + MAX_DMA_SPI_TASK_SIZE - 1) / MAX_DMA_SPI_TASK_SIZE;
 
-  volatile uint32_t *dmaData = (volatile uint32_t *)GrabFreeDMASourceBytes(8+4*(numDMASendTasks-1)+4*numDMASendTasks+task->size);
-
-  // TODO: Make these statically allocated, no need to reallocate constant data for each task
-  volatile uint32_t *constantData = dmaData;
-  constantData[0] = BCM2835_SPI0_CS_DMAEN; // constantData[0] is for disableTransferActive task
-  constantData[1] = BCM2835_DMA_CS_ACTIVE | BCM2835_DMA_CS_END; // constantData[1] is for startDMATxChannel task
-
-  volatile uint32_t *setDMATxAddressData = dmaData+2;
-  volatile uint32_t *txData = dmaData+2+numDMASendTasks-1;
+  volatile uint32_t *dmaData = (volatile uint32_t *)GrabFreeDMASourceBytes(4*(numDMASendTasks-1)+4*numDMASendTasks+task->PayloadSize());
+  volatile uint32_t *setDMATxAddressData = dmaData;
+  volatile uint32_t *txData = dmaData+numDMASendTasks-1;
 
   volatile DMAControlBlock *cb = GrabFreeCBs(numDMASendTasks*5-3);
 
@@ -416,8 +513,17 @@ void SPIDMATransfer(SPITask *task)
   volatile DMAControlBlock *tx0 = &cb[0];
   volatile DMAControlBlock *rx0 = &cb[1];
 
-  uint8_t *data = (uint8_t*)&task->data[0];
-  int bytesLeft = task->size;
+#ifdef OFFLOAD_PIXEL_COPY_TO_DMA_CPP
+  uint8_t *data = task->fb;
+  uint8_t *prevData = task->prevFb;
+  const bool taskAndFramebufferSizesCompatibleWithTightMemcpy = (task->PayloadSize() % 32 == 0) && (task->width % 16 == 0);
+#else
+  uint8_t *data = task->PayloadStart();
+#endif
+
+  int bytesLeft = task->PayloadSize();
+  int taskStartX = 0;
+
   while(bytesLeft > 0)
   {
     int sendSize = MIN(bytesLeft, MAX_DMA_SPI_TASK_SIZE);
@@ -425,8 +531,32 @@ void SPIDMATransfer(SPITask *task)
 
     volatile DMAControlBlock *tx = cb++;
     txData[0] = BCM2835_SPI0_CS_TA | DISPLAY_SPI_DRIVE_SETTINGS | (sendSize << 16); // The first four bytes written to the SPI data register control the DLEN and CS,CPOL,CPHA settings.
-    memcpy((void*)(txData+1), data, sendSize);
-    data += sendSize;
+    // This is really sad: we must do a memcpy to prepare for DMA controller to be able to do a memcpy. The reason for this is that the DMA source memory area must be in cache bypassing
+    // region of memory, which the SPI source ring buffer is not. It could be allocated to be so however, but bypassing the caches on the SPI ring buffer would cause a massive -51.5%
+    // profiled overall performance drop (tested on Pi3B+ and Tontec 3.5" 480x320 display on gpu test pattern, see branch non_intermediate_memcpy_for_dma). Therefore just keep doing
+    // this memcpy() to prepare for DMA to do its memcpy(), as it is faster overall. (If there was a way to map same physical memory to virtual address space twice, once cached, and
+    // another time uncached, and have writes bypass the cache and only write combine, but have reads follow the cache, then it might work without a perf hit, but not at all sure if
+    // that would be technically possible)
+    uint16_t *txPtr = (uint16_t*)(txData+1);
+
+    // If task->prevFb is present, the DMA backend is responsible for streaming pixel data from current framebuffer to old framebuffer, and the DMA task buffer.
+    // If not present, then that preparation has been already done by the caller.
+#ifdef OFFLOAD_PIXEL_COPY_TO_DMA_CPP
+    if (prevData)
+    {
+      // For 2D pixel data, do a "everything in one pass"
+      if (taskAndFramebufferSizesCompatibleWithTightMemcpy)
+        memcpy_to_dma_and_prev_framebuffer((uint16_t*)txPtr, (uint16_t**)&prevData, (uint16_t**)&data, sendSize, &taskStartX, task->width, gpuFramebufferScanlineStrideBytes);
+      else
+        memcpy_to_dma_and_prev_framebuffer_in_c((uint16_t*)txPtr, (uint16_t**)&prevData, (uint16_t**)&data, sendSize, &taskStartX, task->width, gpuFramebufferScanlineStrideBytes);
+    }
+    else
+#endif
+    {
+      memcpy(txPtr, data, sendSize);
+      data += sendSize;
+    }
+
     tx->ti = BCM2835_DMA_TI_PERMAP(BCM2835_DMA_TI_PERMAP_SPI_TX) | BCM2835_DMA_TI_DEST_DREQ | BCM2835_DMA_TI_SRC_INC | BCM2835_DMA_TI_WAIT_RESP;
     tx->src = VIRT_TO_BUS(dmaSourceBuffer, txData);
     tx->dst = DMA_SPI_FIFO_PHYS_ADDRESS; // Write out to the SPI peripheral
@@ -458,13 +588,13 @@ void SPIDMATransfer(SPITask *task)
       ++setDMATxAddressData;
 
       disableTransferActive->ti = BCM2835_DMA_TI_SRC_INC | BCM2835_DMA_TI_DEST_INC | BCM2835_DMA_TI_WAIT_RESP;
-      disableTransferActive->src = VIRT_TO_BUS(dmaSourceBuffer, &constantData[0]);
+      disableTransferActive->src = dmaConstantData.busAddress;
       disableTransferActive->dst = DMA_SPI_CS_PHYS_ADDRESS;
       disableTransferActive->len = 4;
       disableTransferActive->next = VIRT_TO_BUS(dmaCb, startDMATxChannel);
 
       startDMATxChannel->ti = BCM2835_DMA_TI_SRC_INC | BCM2835_DMA_TI_DEST_INC | BCM2835_DMA_TI_WAIT_RESP;
-      startDMATxChannel->src = VIRT_TO_BUS(dmaSourceBuffer, &constantData[1]);
+      startDMATxChannel->src = dmaConstantData.busAddress+4;
       startDMATxChannel->dst = DMA_DMA0_CB_PHYS_ADDRESS + dmaTxChannel*0x100;
       startDMATxChannel->len = 4;
       startDMATxChannel->next = VIRT_TO_BUS(dmaCb, rx);
@@ -488,36 +618,45 @@ void SPIDMATransfer(SPITask *task)
     usleep(250);
     CheckSPIDMAChannelsNotStolen();
     if (tick() - dmaTaskStart > 5000000)
+    {
+      DumpDMAState();
       FATAL_ERROR("DMA TX channel has stalled!");
+    }
   }
   while((dmaRx->cs & BCM2835_DMA_CS_ACTIVE) && programRunning)
   {
     usleep(250);
     CheckSPIDMAChannelsNotStolen();
     if (tick() - dmaTaskStart > 5000000)
+    {
+      DumpDMAState();
       FATAL_ERROR("DMA RX channel has stalled!");
+    }
   }
   if (!programRunning) return;
 
-  pendingTaskBytes = task->size;
+  pendingTaskBytes = task->PayloadSize();
 
   // First send the SPI command byte in Polled SPI mode
   spi->cs = BCM2835_SPI0_CS_TA | BCM2835_SPI0_CS_CLEAR | DISPLAY_SPI_DRIVE_SETTINGS;
+
+#ifndef SPI_3WIRE_PROTOCOL
   CLEAR_GPIO(GPIO_TFT_DATA_CONTROL);
-#ifdef ILI9486
+#ifdef DISPLAY_SPI_BUS_IS_16BITS_WIDE
   spi->fifo = 0;
-#endif
   spi->fifo = task->cmd;
-#ifdef ILI9486
   while(!(spi->cs & (BCM2835_SPI0_CS_DONE))) /*nop*/;
-  // spi->fifo; // Currently no need to flush these, the disableTA DMA task clears rx queue.
+  // spi->fifo; // Currently no need to flush these, the clear below clears the rx queue.
   // spi->fifo;
 #else
+  spi->fifo = task->cmd;
   while(!(spi->cs & (BCM2835_SPI0_CS_RXD|BCM2835_SPI0_CS_DONE))) /*nop*/;
-  // spi->fifo;
+  // spi->fifo; // Currently no need to flush this, the clear below clears the rx queue.
 #endif
 
   SET_GPIO(GPIO_TFT_DATA_CONTROL);
+#endif
+
   spi->cs = BCM2835_SPI0_CS_DMAEN | BCM2835_SPI0_CS_CLEAR | DISPLAY_SPI_DRIVE_SETTINGS;
 
   dmaTx->cbAddr = VIRT_TO_BUS(dmaCb, tx0);
@@ -534,20 +673,21 @@ void SPIDMATransfer(SPITask *task)
 {
   // Transition the SPI peripheral to enable the use of DMA
   spi->cs = BCM2835_SPI0_CS_DMAEN | BCM2835_SPI0_CS_CLEAR | DISPLAY_SPI_DRIVE_SETTINGS;
-  task->dmaSpiHeader = BCM2835_SPI0_CS_TA | DISPLAY_SPI_DRIVE_SETTINGS | (task->size << 16); // The first four bytes written to the SPI data register control the DLEN and CS,CPOL,CPHA settings.
+  uint32_t *headerAddr = task->DmaSpiHeaderAddress();
+  *headerAddr = BCM2835_SPI0_CS_TA | DISPLAY_SPI_DRIVE_SETTINGS | (task->PayloadSize() << 16); // The first four bytes written to the SPI data register control the DLEN and CS,CPOL,CPHA settings.
 
   // TODO: Ideally we would be able to directly perform the DMA from the SPI ring buffer from 'task' pointer. However
   // that pointer is shared to userland, and it is proving troublesome to make it both userland-writable as well as cache-bypassing DMA coherent.
   // Therefore these two memory areas are separate for now, and we memcpy() from SPI ring buffer to an intermediate 'dmaSourceMemory' memory area to perform
   // the DMA transfer. Is there a way to avoid this intermediate buffer? That would improve performance a bit.
-  memcpy(dmaSourceBuffer.virtualAddr, (void*)&task->dmaSpiHeader, task->size + 4);
+  memcpy(dmaSourceBuffer.virtualAddr, headerAddr, task->PayloadSize() + 4);
 
   volatile DMAControlBlock *cb = (volatile DMAControlBlock *)dmaCb.virtualAddr;
   volatile DMAControlBlock *txcb = &cb[0];
   txcb->ti = BCM2835_DMA_TI_PERMAP(BCM2835_DMA_TI_PERMAP_SPI_TX) | BCM2835_DMA_TI_DEST_DREQ | BCM2835_DMA_TI_SRC_INC | BCM2835_DMA_TI_WAIT_RESP;
   txcb->src = dmaSourceBuffer.busAddress;
   txcb->dst = DMA_SPI_FIFO_PHYS_ADDRESS; // Write out to the SPI peripheral 
-  txcb->len = task->size + 4;
+  txcb->len = task->PayloadSize() + 4;
   txcb->stride = 0;
   txcb->next = 0;
   txcb->debug = 0;
@@ -558,7 +698,7 @@ void SPIDMATransfer(SPITask *task)
   rxcb->ti = BCM2835_DMA_TI_PERMAP(BCM2835_DMA_TI_PERMAP_SPI_RX) | BCM2835_DMA_TI_SRC_DREQ | BCM2835_DMA_TI_DEST_IGNORE;
   rxcb->src = DMA_SPI_FIFO_PHYS_ADDRESS;
   rxcb->dst = 0;
-  rxcb->len = task->size;
+  rxcb->len = task->PayloadSize();
   rxcb->stride = 0;
   rxcb->next = 0;
   rxcb->debug = 0;
@@ -570,7 +710,7 @@ void SPIDMATransfer(SPITask *task)
   dmaRx->cs = BCM2835_DMA_CS_ACTIVE;
   __sync_synchronize();
 
-  double pendingTaskUSecs = task->size * spiUsecsPerByte;
+  double pendingTaskUSecs = task->PayloadSize() * spiUsecsPerByte;
   if (pendingTaskUSecs > 70)
     usleep(pendingTaskUSecs-70);
 
@@ -603,6 +743,7 @@ void DeinitDMA(void)
   ResetDMAChannels();
   FreeUncachedGpuMemory(dmaSourceBuffer);
   FreeUncachedGpuMemory(dmaCb);
+  FreeUncachedGpuMemory(dmaConstantData);
   if (dmaTxChannel != -1)
   {
     FreeDMAChannel(dmaTxChannel);

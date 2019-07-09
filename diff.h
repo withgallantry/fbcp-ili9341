@@ -25,7 +25,7 @@ extern Span *spans;
 // spans, it is all the same to just update through those pixels as well to not have to wait to flush the FIFO.
 #if defined(ALL_TASKS_SHOULD_DMA)
 #define SPAN_MERGE_THRESHOLD 320
-#elif defined(ILI9486)
+#elif defined(DISPLAY_SPI_BUS_IS_16BITS_WIDE)
 #define SPAN_MERGE_THRESHOLD 10
 #elif defined(HX8357D)
 #define SPAN_MERGE_THRESHOLD 6
@@ -35,6 +35,10 @@ extern Span *spans;
 
 void DiffFramebuffersToSingleChangedRectangle(uint16_t *framebuffer, uint16_t *prevFramebuffer, Span *&head);
 
-void DiffFramebuffersToScanlineSpans(uint16_t *framebuffer, uint16_t *prevFramebuffer, bool interlacedDiff, int interlacedFieldParity, Span *&head);
+void DiffFramebuffersToScanlineSpansExact(uint16_t *framebuffer, uint16_t *prevFramebuffer, bool interlacedDiff, int interlacedFieldParity, Span *&head);
+
+void DiffFramebuffersToScanlineSpansFastAndCoarse4Wide(uint16_t *framebuffer, uint16_t *prevFramebuffer, bool interlacedDiff, int interlacedFieldParity, Span *&head);
+
+void NoDiffChangedRectangle(Span *&head);
 
 void MergeScanlineSpanList(Span *listHead);

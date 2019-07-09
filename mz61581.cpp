@@ -7,24 +7,6 @@
 #include <memory.h>
 #include <stdio.h>
 
-static void MZ61581ClearScreen()
-{
-  // Since we are doing delta updates to only changed pixels, clear display initially to black for known starting state
-  for(int y = 0; y < DISPLAY_HEIGHT; ++y)
-  {
-    SPI_TRANSFER(DISPLAY_SET_CURSOR_X, 0, 0, DISPLAY_WIDTH >> 8, DISPLAY_WIDTH & 0xFF);
-    SPI_TRANSFER(DISPLAY_SET_CURSOR_Y, (uint8_t)(y >> 8), (uint8_t)(y & 0xFF), DISPLAY_HEIGHT >> 8, DISPLAY_HEIGHT & 0xFF);
-    SPITask *clearLine = AllocTask(DISPLAY_WIDTH*2);
-    clearLine->cmd = DISPLAY_WRITE_PIXELS;
-    memset(clearLine->data, 0, clearLine->size);
-    CommitTask(clearLine);
-    RunSPITask(clearLine);
-    DoneTask(clearLine);
-  }
-  SPI_TRANSFER(DISPLAY_SET_CURSOR_X, 0, 0, DISPLAY_WIDTH >> 8, DISPLAY_WIDTH & 0xFF);
-  SPI_TRANSFER(DISPLAY_SET_CURSOR_Y, 0, 0, DISPLAY_HEIGHT >> 8, DISPLAY_HEIGHT & 0xFF);
-}
-
 void InitMZ61581()
 {
   // If a Reset pin is defined, toggle it briefly high->low->high to enable the device. Some devices do not have a reset pin, in which case compile with GPIO_TFT_RESET_PIN left undefined.
@@ -67,14 +49,17 @@ void InitMZ61581()
 #define MADCTL_ROW_COLUMN_EXCHANGE (1<<5)
 #define MADCTL_COLUMN_ADDRESS_ORDER_SWAP (1<<6)
 #define MADCTL_ROW_ADDRESS_ORDER_SWAP (1<<7)
-#define MADCTL_ROTATE_180_DEGREES 0xC0
+#define MADCTL_ROTATE_180_DEGREES (MADCTL_COLUMN_ADDRESS_ORDER_SWAP | MADCTL_ROW_ADDRESS_ORDER_SWAP)
 
-    uint8_t madctl = MADCTL_BGR_PIXEL_ORDER | MADCTL_COLUMN_ADDRESS_ORDER_SWAP;
-#ifdef DISPLAY_ROTATE_180_DEGREES
-    madctl |= MADCTL_ROTATE_180_DEGREES;
+    uint8_t madctl = MADCTL_COLUMN_ADDRESS_ORDER_SWAP;
+#ifndef DISPLAY_SWAP_BGR
+    madctl |= MADCTL_BGR_PIXEL_ORDER;
 #endif
-#if defined(DISPLAY_OUTPUT_LANDSCAPE) && !defined(DISPLAY_FLIP_OUTPUT_XY_IN_SOFTWARE)
+#if defined(DISPLAY_FLIP_ORIENTATION_IN_HARDWARE)
     madctl |= MADCTL_ROW_COLUMN_EXCHANGE;
+#endif
+#ifdef DISPLAY_ROTATE_180_DEGREES
+    madctl ^= MADCTL_ROTATE_180_DEGREES;
 #endif
     SPI_TRANSFER(0x36/*MADCTL: Memory Access Control*/, madctl);
 
@@ -90,13 +75,14 @@ void InitMZ61581()
     CLEAR_GPIO(GPIO_TFT_BACKLIGHT); // And turn the backlight on. MZ61581 backlight is on when the Backlight GPIO pin is 0.
 #endif
 
-    MZ61581ClearScreen();
+    ClearScreen();
   }
 #ifndef USE_DMA_TRANSFERS // For DMA transfers, keep SPI CS & TA active.
   END_SPI_COMMUNICATION();
 #endif
 
   // And speed up to the desired operation speed finally after init is done.
+  usleep(10 * 1000); // Delay a bit before restoring CLK, or otherwise this has been observed to cause the display not init if done back to back after the clear operation above.
   spi->clk = SPI_BUS_CLOCK_DIVISOR;
 }
 
@@ -130,7 +116,8 @@ void TurnDisplayOn()
 
 void DeinitSPIDisplay()
 {
-
+  ClearScreen();
+  SPI_TRANSFER(/*Display OFF*/0x28);
 }
 
 #endif

@@ -1,14 +1,11 @@
 #pragma once
 
-#ifdef ILI9341
+#if defined(ILI9341) || defined(ILI9340)
 
-// Specifies how fast to communicate the SPI bus at. Possible values are 4, 6, 8, 10, 12, ... Smaller
+// SPI_BUS_CLOCK_DIVISOR specifies how fast to communicate the SPI bus at. Possible values are 4, 6, 8, 10, 12, ... Smaller
 // values are faster. On my PiTFT 2.8 and Waveshare32b displays, divisor value of 4 does not work, and
 // 6 is the fastest possible. While developing, it was observed that a value of 12 or higher did not
 // actually work either, and only 6, 8 and 10 were functioning properly.
-#ifndef SPI_BUS_CLOCK_DIVISOR
-#error Please define -DSPI_BUS_CLOCK_DIVISOR=<some even number> on the CMake command line! (see file ili9341.h for details). This parameter along with core_freq=xxx in /boot/config.txt defines the SPI display speed.
-#endif
 
 // On Adafruit PiTFT 2.8", the following speed configurations have been tested (on a Pi 3B):
 // core_freq=400: CDIV=6, results in 66.67MHz, works
@@ -26,30 +23,49 @@
 // core_freq=338: CDIV=4, results in 84.5MHz, works
 // core_freq=339: CDIV=4, would result in 84.75MHz, would work most of the time, but every few minutes generated random glitched pixels.
 
-
 // Data specific to the ILI9341 controller
-#define DISPLAY_BYTESPERPIXEL 2
 #define DISPLAY_SET_CURSOR_X 0x2A
 #define DISPLAY_SET_CURSOR_Y 0x2B
 #define DISPLAY_WRITE_PIXELS 0x2C
 
 // ILI9341 displays are able to update at any rate between 61Hz to up to 119Hz. Default at power on is 70Hz.
 #define ILI9341_FRAMERATE_61_HZ 0x1F
+#define ILI9341_FRAMERATE_63_HZ 0x1E
+#define ILI9341_FRAMERATE_65_HZ 0x1D
+#define ILI9341_FRAMERATE_68_HZ 0x1C
 #define ILI9341_FRAMERATE_70_HZ 0x1B
+#define ILI9341_FRAMERATE_73_HZ 0x1A
+#define ILI9341_FRAMERATE_76_HZ 0x19
 #define ILI9341_FRAMERATE_79_HZ 0x18
+#define ILI9341_FRAMERATE_83_HZ 0x17
+#define ILI9341_FRAMERATE_86_HZ 0x16
+#define ILI9341_FRAMERATE_90_HZ 0x15
+#define ILI9341_FRAMERATE_95_HZ 0x14
+#define ILI9341_FRAMERATE_100_HZ 0x13
+#define ILI9341_FRAMERATE_106_HZ 0x12
+#define ILI9341_FRAMERATE_112_HZ 0x11
 #define ILI9341_FRAMERATE_119_HZ 0x10
 
-// Visually estimating NES Super Mario Bros 3 "match mushroom, flower, star" arcade game, 119Hz gives most tear
-// free scrolling, so default to using that.
+// Visually estimating NES Super Mario Bros 3 "match mushroom, flower, star" arcade game, 119Hz gives visually
+// most pleasing result, so default to using that. You can also try other settings above. 119 Hz should give
+// lowest latency, perhaps 61 Hz might give least amount of tearing, although this can be quite subjective.
 #define ILI9341_UPDATE_FRAMERATE ILI9341_FRAMERATE_119_HZ
 
-#if defined(DISPLAY_FLIP_OUTPUT_XY_IN_SOFTWARE) || !defined(DISPLAY_OUTPUT_LANDSCAPE)
-#define DISPLAY_WIDTH 320
-#define DISPLAY_HEIGHT 240
+// Appears in ILI9341 Data Sheet v1.11 (2011/06/10), but not in older v1.02 (2010/12/06). This has a subtle effect on colors/saturation.
+// Valid values are 0x20 and 0x30. Spec says 0x20 is default at boot, but doesn't seem so, more like 0x00 is default, giving supersaturated colors. I like 0x30 best.
+// Value 0x30 doesn't seem to be available on ILI9340.
+#define ILI9341_PUMP_CONTROL_2XVCI 0x20
+#define ILI9341_PUMP_CONTROL_3XVCI 0x30
+
+#ifdef ILI9341
+#define ILI9341_PUMP_CONTROL ILI9341_PUMP_CONTROL_3XVCI 
 #else
-#define DISPLAY_WIDTH 320
-#define DISPLAY_HEIGHT 240
+#define ILI9341_PUMP_CONTROL ILI9341_PUMP_CONTROL_2XVCI
 #endif
+
+
+#define DISPLAY_NATIVE_WIDTH 320
+#define DISPLAY_NATIVE_HEIGHT 240
 
 #ifdef ADAFRUIT_ILI9341_PITFT
 #include "pitft_28r_ili9341.h"
@@ -57,19 +73,10 @@
 #include "pitft_35r_hx8357d.h"
 #elif defined(FREEPLAYTECH_WAVESHARE32B)
 #include "freeplaytech_waveshare32b.h"
-#elif !defined(ILI9341)
-#error Please reconfigure CMake with -DADAFRUIT_ILI9341_PITFT=ON, -FREEPLAYTECH_WAVESHARE32B=ON or -DILI9341=ON (or contribute ports to more displays yourself)
-#endif
-
-#if !defined(GPIO_TFT_DATA_CONTROL)
-#error Please reconfigure CMake with -DGPIO_TFT_DATA_CONTROL=<int> specifying which pin your display is using for the Data/Control line!
 #endif
 
 #define InitSPIDisplay InitILI9341
 
 void InitILI9341(void);
-
-void TurnDisplayOn(void);
-void TurnDisplayOff(void);
 
 #endif
