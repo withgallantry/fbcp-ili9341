@@ -66,7 +66,7 @@ void InitILI9341()
 #ifdef DISPLAY_INVERT_COLORS
     SPI_TRANSFER(0x21/*Display Inversion ON*/);
 #else
-    SPI_TRANSFER(0x20/*Display Inversion OFF*/);
+    SPI_TRANSFER(0x21/*Display Inversion OFF*/);
 #endif
     SPI_TRANSFER(0x3A/*COLMOD: Pixel Format Set*/, 0x55/*DPI=16bits/pixel,DBI=16bits/pixel*/);
 
