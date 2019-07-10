@@ -87,7 +87,6 @@ void InitILI9341()
     // It seems that in internal clock mode, horizontal front and back porch settings (HFP, BFP) are ignored(?)
 
     SPI_TRANSFER(0xB1/*Frame Rate Control (In Normal Mode/Full Colors)*/, 0x00/*DIVA=fosc*/, ILI9341_UPDATE_FRAMERATE/*RTNA(Frame Rate)*/);
-    SPI_TRANSFER(0x21/*Color inverse*/);
 //    SPI_TRANSFER(0xB5/*Blanking Porch Control*/, 0x02/*VFP, vertical front porch*/, 0x02/*VBP, vertical back porch*/, 0x0A/*HFP, horizontal front porch*/, 0x14/*HBP, horizontal back porch*/); // These are the default values at power on
      printf("Colour inverse");
     SPI_TRANSFER(0xB6/*Display Function Control*/, 0x08/*PTG=Interval Scan,PT=V63/V0/VCOML/VCOMH*/, 0x82/*REV=1(Normally white),ISC(Scan Cycle)=5 frames*/, 0x27/*LCD Driver Lines=320*/);
